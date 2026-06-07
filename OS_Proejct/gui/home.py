@@ -17,12 +17,14 @@ class HomeScreen:
     def __init__(self):
         self.root = tk.Tk()
         self.root.title("OS Simulator")
-        self.root.geometry("1200x1000")
+        self.root.geometry("1200x1080")
         self.root.configure(bg=BG)
-        self.root.minsize(1000, 950)
+        self.root.minsize(1000, 1000)
 
         self._active_btn = None
         self._build_layout()
+        self._active_label = "🏠  Home"
+        self._nav_buttons["🏠  Home"].configure(fg=BG, bg=ACCENT)
         self.show_welcome()
 
     # ══════════════════════════════════════════
@@ -64,6 +66,10 @@ class HomeScreen:
             ("💾  Virtual Memory",   self.show_virtual),
             ("📀  Mass Storage",     self.show_storage),
         ]
+
+        # Store commands by label so card buttons can look them up
+        self._nav_commands = {label: cmd for label, cmd in nav_items}
+        self._active_label = None
 
         self._nav_buttons = {}
         for label, cmd in nav_items:
@@ -122,6 +128,10 @@ class HomeScreen:
         self._canvas.itemconfig(self._canvas_window, width=event.width)
 
     def _nav_click(self, command, label):
+        # Don't reset if already on this screen
+        if self._active_label == label:
+            return
+        self._active_label = label
         # Reset all buttons
         for lbl, btn in self._nav_buttons.items():
             btn.configure(fg=TEXT_DIM, bg=SURFACE)
@@ -164,16 +174,16 @@ class HomeScreen:
         ).pack(pady=(0, 40))
 
         modules = [
-            ("⚙️  CPU Scheduling",  "FCFS · SJF · SRTF · Priority · Round Robin",   self.show_cpu),
-            ("🧠  Memory Mgmt",     "With / without compaction",                      self.show_memory),
-            ("💾  Virtual Memory",  "SSTF disk scheduling & track count",             self.show_virtual),
-            ("📀  Mass Storage",    "Mass storage management",                        self.show_storage),
+            ("⚙️  CPU Scheduling",  "FCFS · SJF · SRTF · Priority · Round Robin",   "⚙️  CPU Scheduling"),
+            ("🧠  Memory Mgmt",     "With / without compaction",                      "🧠  Memory Mgmt"),
+            ("💾  Virtual Memory",  "SSTF disk scheduling & track count",             "💾  Virtual Memory"),
+            ("📀  Mass Storage",    "Mass storage management",                        "📀  Mass Storage"),
         ]
 
         cards_frame = tk.Frame(wrapper, bg=BG)
         cards_frame.pack()
 
-        for i, (title, desc, cmd) in enumerate(modules):
+        for i, (title, desc, nav_label) in enumerate(modules):
             card = tk.Frame(cards_frame, bg=SURFACE, bd=0, relief="flat", padx=20, pady=18, cursor="hand2")
             card.grid(row=i // 2, column=i % 2, padx=10, pady=10, sticky="nsew")
 
@@ -181,7 +191,8 @@ class HomeScreen:
             tk.Label(card, text=desc,  font=("Consolas", 10),         fg=TEXT_DIM, bg=SURFACE).pack(anchor="w", pady=(4, 8))
 
             tk.Button(
-                card, text="Open →", command=cmd,
+                card, text="Open →",
+                command=lambda l=nav_label: self._nav_click(self._nav_commands[l], l),
                 font=("Consolas", 10, "bold"),
                 bg=ACCENT, fg=BG,
                 relief="flat", cursor="hand2", padx=10, pady=4

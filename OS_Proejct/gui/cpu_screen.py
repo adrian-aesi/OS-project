@@ -72,13 +72,25 @@ def _gantt_to_log(gantt: list, processes: list) -> list:
 class CPUScreen:
 
     def __init__(self, parent_frame):
-        self.parent   = parent_frame
-        self.processes = []
+        self.parent      = parent_frame
+        self.processes   = []
         self.row_entries = []
 
-        # Gantt canvas refs (rebuilt each run)
-        self._gantt_canvas = None
-        self._gantt_hsb    = None
+        # Gantt step state
+        self._gantt_canvas  = None
+        self._gantt_hsb     = None
+        self._gantt_log     = []      # full per-tick log
+        self._gantt_procs   = []      # process list for current run
+        self._gantt_colors  = {}      # pid -> colour
+        self._gantt_fin     = {}      # pid -> finish tick
+        self._gantt_tick    = 0       # ticks revealed so far
+        self._gantt_maxT    = 0
+        self._step_btn      = None
+        self._back_btn      = None
+        self._step_lbl      = None
+        self._step_size_var = None    # StringVar for step-size spinbox
+        self._saved_results = None    # kept until sim done, then stats shown
+        self._stats_frame   = None
 
         self._build_ui()
 
@@ -134,10 +146,17 @@ class CPUScreen:
         scrollbar.pack(side="right", fill="y")
 
         btn_row = tk.Frame(section, bg=BG)
-        btn_row.pack(fill="x", padx=5, pady=(0, 8))
+        btn_row.pack(fill="x", padx=5, pady=(0, 4))
         self._btn(btn_row, "+ Add Row",      self._add_row,         ACCENT).pack(side="left", padx=4)
         self._btn(btn_row, "✕ Remove Last",  self._remove_last_row, ERROR ).pack(side="left", padx=4)
         self._btn(btn_row, "⟳ Clear All",    self._clear_rows,      TEXT_DIM).pack(side="left", padx=4)
+
+        tk.Label(
+            section,
+            text="💡 Values are randomized for quick simulation — feel free to customize them!",
+            font=("Consolas", 9, "italic"),
+            fg=ACCENT2, bg=BG, anchor="w"
+        ).pack(fill="x", padx=10, pady=(0, 8))
 
         for _ in range(3):
             self._add_row()
@@ -147,10 +166,17 @@ class CPUScreen:
         row_frame = tk.Frame(self.rows_frame, bg=BG)
         row_frame.pack(fill="x", pady=2)
 
+        import random
         entries    = {}
         col_widths = [6, 14, 12, 10, 10]
         fields     = ["pid", "arrival", "burst", "priority", "quantum"]
-        defaults   = [f"P{row_num}", "0", "0", "0", "2"]
+        defaults   = [
+            f"P{row_num}",
+            str(random.randint(0, 9)),   # arrival: random 0-9
+            str(random.randint(1, 9)),   # burst:   random 1-9 (never 0)
+            str(row_num),                # priority: 1, 2, 3...
+            "2",                         # quantum: always 2
+        ]
 
         for field, w, default in zip(fields, col_widths, defaults):
             e = tk.Entry(row_frame, width=w, font=("Consolas", 10),
@@ -310,47 +336,103 @@ class CPUScreen:
                  font=("Consolas", 13, "bold"), fg=ACCENT2, bg=BG
                  ).pack(pady=(10, 4))
 
-        # ── Gantt chart (classmate's per-process row style) ────────────────
-        self._draw_gantt_rows(gantt, original_processes)
+        # Save results — shown in stats only after sim completes
+        self._saved_results = results
 
-        # ── Stats table ────────────────────────────────────────────────────
-        self._draw_stats_table(results)
+        # Build Gantt shell (step-by-step)
+        self._init_gantt(gantt, original_processes)
 
     # ══════════════════════════════════════════
-    #  GANTT CHART  (classmate's row-per-process design)
+    #  GANTT  —  step-by-step (classmate style)
     # ══════════════════════════════════════════
 
-    def _draw_gantt_rows(self, gantt: list, processes: list):
-        """
-        Render a per-process row Gantt chart (adapted from classmate's
-        _build_gantt_shell + _redraw_gantt), driven by your scheduler output.
-        """
-        # Build colour map  pid -> colour
-        color_map = {}
+    def _init_gantt(self, gantt: list, processes: list):
+        """Set up the Gantt state and shell; chart starts empty."""
+        # ── state ──────────────────────────────────────────────────────────
         for i, p in enumerate(processes):
-            color_map[p.pid] = PROC_COLORS[i % len(PROC_COLORS)]
+            self._gantt_colors[p.pid] = PROC_COLORS[i % len(PROC_COLORS)]
 
-        # Convert [(pid, start, end)] → per-tick log [{pid, t}, ...]
-        log = _gantt_to_log(gantt, processes)
-        maxT = len(log)
-        if maxT == 0:
-            return
+        self._gantt_log   = _gantt_to_log(gantt, processes)
+        self._gantt_procs = processes
+        self._gantt_maxT  = len(self._gantt_log)
+        self._gantt_tick  = 0
 
+        # Finish tick per process
+        self._gantt_fin = {}
+        for p in processes:
+            slots = [e["t"] for e in self._gantt_log if e["pid"] == p.pid]
+            self._gantt_fin[p.pid] = (slots[-1] + 1) if slots else float("inf")
+
+        # ── control bar  (BACK / STEP / RESET + step-size) ──────────────────
+        ctrl = tk.Frame(self.results_frame, bg=BG)
+        ctrl.pack(fill="x", padx=4, pady=(0, 4))
+
+        # ◀ BACK button
+        self._back_btn = tk.Button(
+            ctrl,
+            text="◀  BACK",
+            font=("Consolas", 11, "bold"),
+            bg=SURFACE, fg=TEXT_DIM,
+            activebackground=TEXT, activeforeground=BG,
+            relief="flat", cursor="hand2", pady=6, padx=14,
+            state="disabled",
+            command=self._gantt_back
+        )
+        self._back_btn.pack(side="left", padx=(0, 4))
+
+        # ⏭ STEP button
+        self._step_btn = tk.Button(
+            ctrl,
+            text="⏭  STEP   t = 0 →",
+            font=("Consolas", 11, "bold"),
+            bg=ACCENT, fg=BG,
+            activebackground=TEXT, activeforeground=BG,
+            relief="flat", cursor="hand2", pady=6, padx=14,
+            command=self._gantt_step
+        )
+        self._step_btn.pack(side="left", padx=(0, 8))
+
+        # Step-size label + spinbox
+        tk.Label(ctrl, text="step:", font=("Consolas", 9),
+                 fg=TEXT_DIM, bg=BG).pack(side="left")
+
+        self._step_size_var = tk.StringVar(value="1")
+        spinbox = tk.Spinbox(
+            ctrl, from_=1, to=20, width=3,
+            textvariable=self._step_size_var,
+            font=("Consolas", 11, "bold"),
+            bg=SURFACE, fg=ACCENT2,
+            insertbackground=ACCENT2,
+            relief="flat", bd=4,
+            justify="center",
+            buttonbackground=SURFACE,
+        )
+        spinbox.pack(side="left", padx=(2, 12))
+
+        # ↺ RESET
+        tk.Button(
+            ctrl, text="↺  RESET SIM",
+            font=("Consolas", 9),
+            bg=SURFACE, fg=TEXT_DIM,
+            relief="flat", cursor="hand2", pady=6, padx=10,
+            command=self._gantt_reset
+        ).pack(side="left")
+
+        self._step_lbl = tk.Label(
+            ctrl, text="— press STEP to begin",
+            font=("Consolas", 9), fg=TEXT_DIM, bg=BG
+        )
+        self._step_lbl.pack(side="left", padx=10)
+
+        # ── canvas shell ───────────────────────────────────────────────────
         n     = len(processes)
         cv_h  = TOP + n * ROW_H + 8
-        cv_w  = 48 + maxT * CW + 20   # initial; scrollable
+        cv_w  = 48 + self._gantt_maxT * CW + 20
 
-        # Finish times per process (for "waiting" shading)
-        fin = {}
-        for p in processes:
-            slots = [e["t"] for e in log if e["pid"] == p.pid]
-            fin[p.pid] = (slots[-1] + 1) if slots else float("inf")
-
-        # ── outer frame ────────────────────────────────────────────────────
         outer = tk.LabelFrame(self.results_frame, text=" Gantt Chart ",
                               bg=BG, fg=ACCENT, font=("Consolas", 11, "bold"),
                               bd=1, relief="solid")
-        outer.pack(fill="x", pady=(6, 4), padx=4)
+        outer.pack(fill="x", pady=(0, 4), padx=4)
 
         holder = tk.Frame(outer, bg=BG)
         holder.pack(fill="x", padx=8, pady=(4, 8))
@@ -366,62 +448,180 @@ class CPUScreen:
 
         self._gantt_canvas = gc
         self._gantt_hsb    = hsb
+        self._gantt_cv_w   = cv_w
+        self._gantt_cv_h   = cv_h
 
-        def _draw():
-            gc.delete("all")
-            gc.configure(scrollregion=(0, 0, cv_w, cv_h))
+        # Stats placeholder (filled when done)
+        self._stats_frame = tk.Frame(self.results_frame, bg=BG)
+        self._stats_frame.pack(fill="x")
 
-            X0 = 48
+        # Draw the empty grid immediately
+        gc.after(50, self._gantt_redraw)
 
-            # Time labels across the top
-            for i in range(maxT + 1):
-                gc.create_text(X0 + i * CW, 2, text=str(i),
-                               fill=TEXT_DIM, font=("Consolas", 7), anchor="n")
+    def _get_step_size(self):
+        """Read the spinbox value, clamp to 1–20."""
+        try:
+            return max(1, min(20, int(self._step_size_var.get())))
+        except (ValueError, AttributeError):
+            return 1
 
-            # One row per process
-            for ri, p in enumerate(processes):
-                col = color_map[p.pid]
-                y0  = TOP + ri * ROW_H
-                yc  = y0 + CH // 2
+    def _gantt_step(self):
+        """Reveal step_size more tick columns forward."""
+        if self._gantt_tick >= self._gantt_maxT:
+            return
 
-                # Process label on the left
-                gc.create_text(2, yc, text=p.pid,
-                               fill=TEXT_DIM, font=("Consolas", 9, "bold"), anchor="w")
+        step = self._get_step_size()
+        self._gantt_tick = min(self._gantt_tick + step, self._gantt_maxT)
+        self._gantt_redraw()
 
-                for t in range(maxT):
-                    entry   = log[t]
-                    is_run  = entry["pid"] == p.pid
-                    arrived = t >= p.arrival_time
-                    is_done = t >= fin[p.pid]
-                    x0_ = X0 + t * CW
-                    x1_ = x0_ + CW
+        done = self._gantt_tick >= self._gantt_maxT
 
-                    if is_run:
-                        # Solid colour — this process is running
-                        gc.create_rectangle(x0_, y0, x1_, y0 + CH,
-                                            fill=col, outline=col)
-                        gc.create_text(x0_ + CW // 2, yc, text=p.pid,
-                                       fill="white", font=("Consolas", 7, "bold"))
-                    elif arrived and not is_done:
-                        # Faded colour — process is waiting/ready
-                        gc.create_rectangle(x0_, y0, x1_, y0 + CH,
-                                            fill=_blend(col, 0.18),
-                                            outline=_blend(col, 0.40))
-                    else:
-                        # Dark — not arrived yet or already finished
-                        gc.create_rectangle(x0_, y0, x1_, y0 + CH,
-                                            fill=SURFACE, outline=BORDER)
+        # Update BACK button — always enabled once past t=0
+        if self._back_btn:
+            self._back_btn.config(
+                state="normal", fg=TEXT, bg=SURFACE, cursor="hand2"
+            )
 
-            gc.xview_moveto(0)  # start scrolled to the left
+        if done:
+            self._step_btn.config(
+                text="■  DONE",
+                bg=SURFACE, fg=TEXT_DIM,
+                state="disabled", cursor="arrow"
+            )
+            self._step_lbl.config(
+                text="✓  All ticks revealed",
+                fg=SUCCESS, font=("Consolas", 10)
+            )
+            self._draw_stats_table(self._saved_results, parent=self._stats_frame)
+        else:
+            self._step_btn.config(
+                text=f"⏭  STEP   t = {self._gantt_tick} →",
+                bg=ACCENT, fg=BG, state="normal", cursor="hand2"
+            )
+            self._step_lbl.config(text=f"Tick {self._gantt_tick} / {self._gantt_maxT}")
 
-        gc.after(50, _draw)
+    def _gantt_back(self):
+        """Step backward by step_size ticks."""
+        if self._gantt_tick <= 0:
+            return
+
+        # Clear stats if we're rewinding from a finished state
+        was_done = self._gantt_tick >= self._gantt_maxT
+        if was_done:
+            for w in self._stats_frame.winfo_children():
+                w.destroy()
+
+        step = self._get_step_size()
+        self._gantt_tick = max(self._gantt_tick - step, 0)
+        self._gantt_redraw()
+
+        # Re-enable STEP button (in case we were at DONE)
+        self._step_btn.config(
+            text=f"⏭  STEP   t = {self._gantt_tick} →",
+            bg=ACCENT, fg=BG, state="normal", cursor="hand2"
+        )
+        self._step_lbl.config(
+            text=f"Tick {self._gantt_tick} / {self._gantt_maxT}",
+            fg=TEXT_DIM, font=("Consolas", 9)
+        )
+
+        # Disable BACK at t=0
+        if self._gantt_tick <= 0:
+            self._back_btn.config(
+                state="disabled", fg=TEXT_DIM, bg=SURFACE, cursor="arrow"
+            )
+            self._step_lbl.config(text="— press STEP to begin")
+
+    def _gantt_reset(self):
+        """Rewind to t=0 without clearing the whole results area."""
+        self._gantt_tick = 0
+        self._step_btn.config(
+            text="⏭  STEP   t = 0 →",
+            bg=ACCENT, fg=BG,
+            state="normal", cursor="hand2"
+        )
+        self._back_btn.config(
+            state="disabled", fg=TEXT_DIM, bg=SURFACE, cursor="arrow"
+        )
+        self._step_lbl.config(
+            text="— press STEP to begin",
+            fg=TEXT_DIM, font=("Consolas", 9)
+        )
+        # Clear stats
+        for w in self._stats_frame.winfo_children():
+            w.destroy()
+        self._gantt_redraw()
+
+    def _gantt_redraw(self):
+        """Wipe and redraw Gantt canvas up to self._gantt_tick."""
+        gc = self._gantt_canvas
+        if not gc:
+            return
+
+        gc.delete("all")
+        gc.configure(scrollregion=(0, 0, self._gantt_cv_w, self._gantt_cv_h))
+
+        X0       = 48
+        maxT     = self._gantt_maxT
+        revealed = self._gantt_tick
+        log      = self._gantt_log
+        processes = self._gantt_procs
+
+        # ── time labels (all, dimmed for unrevealed) ───────────────────────
+        for i in range(maxT + 1):
+            col = TEXT_DIM if i <= revealed else BORDER
+            gc.create_text(X0 + i * CW, 2, text=str(i),
+                           fill=col, font=("Consolas", 7), anchor="n")
+
+        # ── process rows ───────────────────────────────────────────────────
+        for ri, p in enumerate(processes):
+            col = self._gantt_colors[p.pid]
+            y0  = TOP + ri * ROW_H
+            yc  = y0 + CH // 2
+
+            gc.create_text(2, yc, text=p.pid,
+                           fill=TEXT_DIM, font=("Consolas", 9, "bold"), anchor="w")
+
+            for t in range(maxT):
+                x0_ = X0 + t * CW
+                x1_ = x0_ + CW
+
+                if t >= revealed:
+                    # Future — empty dark cell
+                    gc.create_rectangle(x0_, y0, x1_, y0 + CH,
+                                        fill=SURFACE, outline=BORDER)
+                    continue
+
+                entry   = log[t]
+                is_run  = entry["pid"] == p.pid
+                arrived = t >= p.arrival_time
+                is_done = t >= self._gantt_fin[p.pid]
+
+                if is_run:
+                    gc.create_rectangle(x0_, y0, x1_, y0 + CH,
+                                        fill=col, outline=col)
+                    gc.create_text(x0_ + CW // 2, yc, text=p.pid,
+                                   fill="white", font=("Consolas", 7, "bold"))
+                elif arrived and not is_done:
+                    gc.create_rectangle(x0_, y0, x1_, y0 + CH,
+                                        fill=_blend(col, 0.18),
+                                        outline=_blend(col, 0.40))
+                else:
+                    gc.create_rectangle(x0_, y0, x1_, y0 + CH,
+                                        fill=SURFACE, outline=BORDER)
+
+        # Auto-scroll to keep the latest revealed column visible
+        if revealed > 0:
+            frac = min((revealed * CW) / max(self._gantt_cv_w, 1), 1.0)
+            gc.xview_moveto(max(0, frac - 0.15))
 
     # ══════════════════════════════════════════
     #  STATS TABLE  (your original design, unchanged)
     # ══════════════════════════════════════════
 
-    def _draw_stats_table(self, results):
-        table_section = tk.LabelFrame(self.results_frame, text=" Process Results ",
+    def _draw_stats_table(self, results, parent=None):
+        container = parent if parent is not None else self.results_frame
+        table_section = tk.LabelFrame(container, text=" Process Results ",
                                       bg=BG, fg=ACCENT, font=("Consolas", 11, "bold"),
                                       bd=1, relief="solid")
         table_section.pack(fill="x", pady=(4, 6), padx=4)
@@ -473,8 +673,20 @@ class CPUScreen:
     def _clear_results(self):
         for w in self.results_frame.winfo_children():
             w.destroy()
-        self._gantt_canvas = None
-        self._gantt_hsb    = None
+        self._gantt_canvas  = None
+        self._gantt_hsb     = None
+        self._gantt_log     = []
+        self._gantt_procs   = []
+        self._gantt_colors  = {}
+        self._gantt_fin     = {}
+        self._gantt_tick    = 0
+        self._gantt_maxT    = 0
+        self._step_btn      = None
+        self._back_btn      = None
+        self._step_lbl      = None
+        self._step_size_var = None
+        self._saved_results = None
+        self._stats_frame   = None
 
     def _btn(self, parent, text, command, color, width=14, font_size=10):
         return tk.Button(parent, text=text, command=command, width=width,
